@@ -1,31 +1,56 @@
 # nextcloud-appstore-relay
 
-A small Docker-friendly relay that lets an air-gapped Nextcloud install and
-update apps from the official Nextcloud App Store
-(`https://apps.nextcloud.com/api/v1`) without giving the Nextcloud host
-itself any outbound internet access. The relay sits in a DMZ, talks to the
-upstream store and to GitHub/etc. on Nextcloud's behalf, and exposes a
-byte-identical view of the catalog and tarballs to Nextcloud.
+> Ein schlanker Relay, der einer abgeschotteten Nextcloud-Instanz erlaubt,
+> Apps aus dem offiziellen App Store zu installieren und zu aktualisieren —
+> **ohne** dass die Nextcloud selbst ins Internet darf.
 
-The relay does two things, and only two things:
+Der Relay läuft in der DMZ, spricht stellvertretend mit
+`apps.nextcloud.com` und den Tarball-Hosts (GitHub etc.), und liefert
+Nextcloud eine byte-identische Sicht auf Katalog und Pakete.
 
-1. **Rewrites the `download` URL of every app release** in `apps.json` to
-   point back at itself, so Nextcloud — which would otherwise try to reach
-   `github.com` directly — fetches the tarball from the relay.
-2. **Streams the original tarball bytes through unchanged.** No
-   decompression, no re-archiving, no transformation. Nextcloud's
-   signature check (SHA-512 / `openssl_verify` against the app's
-   certificate in the catalog) is therefore unaffected — see
-   [`LIMITATIONS.md`](LIMITATIONS.md) for the upstream code reference.
+```
+   ┌─────────────────┐         ┌────────────────────┐         ┌──────────────────┐
+   │   Nextcloud     │  HTTP   │       Relay        │  HTTPS  │ apps.nextcloud   │
+   │  (kein Outbound)│ ──────► │      (DMZ)         │ ──────► │ github.com, ...  │
+   └─────────────────┘         │                    │         └──────────────────┘
+                               │ - Rewrite apps.json│
+                               │ - Stream Tarballs  │
+                               │ - Disk-Cache       │
+                               └────────────────────┘
+```
 
-Everything else — caching, logging, conditional GETs — is implementation
-detail.
+Der Relay tut **genau zwei Dinge**, sonst nichts:
+
+1. **Schreibt die `download`-URL** jeder App-Release in `apps.json` so um,
+   dass sie auf den Relay zeigt. Nextcloud — die sonst direkt zu
+   `github.com` greifen würde — holt das Tarball also über den Relay.
+2. **Streamt das Original-Tarball byte-genau durch.** Keine Dekompression,
+   keine Re-Archivierung. Nextclouds Signaturprüfung (`openssl_verify`
+   mit SHA-512 gegen das Zertifikat aus dem Katalog) bleibt damit
+   unverändert gültig — Details siehe [`LIMITATIONS.md`](LIMITATIONS.md).
+
+Alles Weitere (Caching, Logging, Conditional GETs) ist nur
+Implementierungsdetail.
 
 ---
 
-## Quick start (Ubuntu / Debian)
+## Inhaltsverzeichnis
 
-Two commands, on the host that will run the relay:
+- [Quick Start (Ubuntu / Debian)](#quick-start-ubuntu--debian)
+- [Tagesbetrieb](#tagesbetrieb)
+- [Konfiguration](#konfiguration)
+- [Funktionstest](#funktionstest)
+- [Reverse Proxy / HTTPS](#reverse-proxy--https)
+- [Wie Nextcloud den Relay anspricht](#wie-nextcloud-den-relay-anspricht-referenz)
+- [Was kaputt gehen kann](#was-kaputt-gehen-kann-und-wie-mans-merkt)
+- [Build ohne Docker (optional)](#build-ohne-docker-optional)
+- [Lizenz](#lizenz)
+
+---
+
+## Quick Start (Ubuntu / Debian)
+
+Drei Zeilen auf dem Host, der den Relay laufen lassen soll:
 
 ```bash
 git clone https://github.com/AndreWaidelich/nextcloud-appstore-relay.git
@@ -33,112 +58,116 @@ cd nextcloud-appstore-relay
 sudo make install
 ```
 
-The installer (`scripts/install.sh`) is idempotent and does this:
+Der Installer (`scripts/install.sh`) ist idempotent und macht:
 
-1. Detects Ubuntu/Debian.
-2. Installs missing deps: `curl`, `jq`, `docker.io`, `docker-compose-v2`.
-3. Asks for `RELAY_PUBLIC_URL` (the URL your Nextcloud will hit). Default
-   is `http://<host-ip>:8080` for a plain LAN test.
-4. Writes `.env`.
-5. Runs the upstream API sanity check (`make api-check`).
+1. Prüft, dass es ein Ubuntu/Debian ist.
+2. Installiert fehlende Pakete: `curl`, `jq`, `docker.io`, `docker-compose-v2`.
+3. Fragt nach `RELAY_PUBLIC_URL` (die URL, unter der deine Nextcloud den
+   Relay erreicht). Default: `http://<host-ip>:8080`.
+4. Schreibt `.env`.
+5. Führt den Upstream-API-Check aus (`make api-check`).
 6. `docker compose up -d --build`.
-7. Waits for `/healthz` to come up and prints the next-step `occ`
-   command for the Nextcloud side.
+7. Wartet bis `/healthz` antwortet und druckt den `occ`-Befehl, den du
+   noch auf der Nextcloud-Seite ausführen musst.
 
-When it's done, point your Nextcloud at the relay — once, on the Nextcloud
-host:
+Danach **einmal auf der Nextcloud** (nicht hier):
 
 ```bash
 sudo -u www-data php occ config:system:set appstoreurl \
     --value="http://<relay-ip>:8080"
 ```
 
-Open Nextcloud → Admin → Apps, install or update an app. The relay log
-(`make logs`) shows `tarball cache miss -> cached` on first install,
-`tarball cache hit` for repeats.
+Fertig. Admin → Apps installieren oder updaten. `make logs` zeigt im
+Idealfall:
 
-### Non-interactive install
+```
+"tarball cache miss -> cached"   # erster Install
+"tarball cache hit"              # alle weiteren
+```
+
+### Non-interaktive Installation
 
 ```bash
-sudo make install-yes              # uses host's primary IP on :8080
-# or:
+sudo make install-yes                                          # Default: Host-IP:8080
 sudo bash scripts/install.sh --public-url http://10.0.0.5:8080 --yes
 ```
 
 ---
 
-## Day-to-day commands
+## Tagesbetrieb
 
-```
-make logs        # follow container logs
-make status      # container status + cache size on disk
-make api-check   # canary: does upstream API still match the relay's assumptions?
-make restart     # apply changes from .env
-make update      # git pull + rebuild + restart
-make clean-cache # nuke the disk cache (relay re-fetches on next request)
-make stop / make start
-```
-
-`make help` lists everything.
+| Befehl              | Zweck                                                          |
+|---------------------|----------------------------------------------------------------|
+| `make logs`         | Container-Logs folgen                                          |
+| `make status`       | Container-Status + Cache-Größe auf Disk                        |
+| `make api-check`    | Canary: stimmt das Upstream-API-Schema noch?                   |
+| `make restart`      | Änderungen aus `.env` anwenden                                 |
+| `make update`       | `git pull` + neu bauen + neu starten                           |
+| `make stop` / `make start` | Container anhalten / starten                            |
+| `make clean-cache`  | Disk-Cache wegwerfen (Relay holt alles wieder neu)             |
+| `make help`         | Alle Targets auflisten                                         |
 
 ---
 
-## Configuration
+## Konfiguration
 
-All configuration is via environment variables in `.env`. See
+Alles über Umgebungsvariablen in `.env`. Vorlage:
 [`.env.example`](.env.example).
 
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `RELAY_PUBLIC_URL` | **yes** | — | Public URL of the relay as Nextcloud reaches it. Used to rewrite `download` URLs in `apps.json`. |
-| `RELAY_UPSTREAM` | no | `https://apps.nextcloud.com/api/v1` | Upstream app store API. |
-| `RELAY_LISTEN` | no | `:8080` | Listen address. |
-| `RELAY_CACHE_DIR` | no | `/var/cache/relay` | On-disk cache root (mounted from a docker volume). |
-| `RELAY_JSON_TTL` | no | `30m` | How often to re-check the catalog. Refreshes use `If-None-Match`, so a no-op refresh is a single 304 with no body. |
-| `RELAY_UPSTREAM_TIMEOUT` | no | `60s` | Timeout for fetching JSON. |
-| `RELAY_TARBALL_TIMEOUT` | no | `10m` | Timeout for fetching tarballs. |
-| `RELAY_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
+| Variable                  | Pflicht | Default                                  | Bedeutung |
+|---------------------------|:-------:|------------------------------------------|-----------|
+| `RELAY_PUBLIC_URL`        | **ja**  | —                                        | URL, unter der deine Nextcloud den Relay erreicht. Wird in `apps.json` als neue `download`-Basis eingesetzt. |
+| `RELAY_UPSTREAM`          | nein    | `https://apps.nextcloud.com/api/v1`      | Quell-Store. |
+| `RELAY_LISTEN`            | nein    | `:8080`                                  | Listen-Adresse. |
+| `RELAY_CACHE_DIR`         | nein    | `/var/cache/relay`                       | Disk-Cache-Pfad (per Docker-Volume gemountet). |
+| `RELAY_JSON_TTL`          | nein    | `30m`                                    | Wie oft der Katalog gegen den Upstream geprüft wird. Re-Checks nutzen `If-None-Match` — wenn sich nichts geändert hat, ein 304 ohne Body, also billig. |
+| `RELAY_UPSTREAM_TIMEOUT`  | nein    | `60s`                                    | Timeout für JSON-Fetch. |
+| `RELAY_TARBALL_TIMEOUT`   | nein    | `10m`                                    | Timeout für Tarball-Downloads. |
+| `RELAY_LOG_LEVEL`         | nein    | `info`                                   | `debug` · `info` · `warn` · `error`. |
 
-After editing `.env`, run `make restart`.
+Nach Änderungen in `.env`: `make restart`.
 
 ---
 
-## Testing the relay
+## Funktionstest
 
-The relay was built and verified against the live upstream. Re-run the
-same checks against your deployment.
+Der Relay wurde gegen die Live-API verifiziert. Du kannst die gleichen
+Checks gegen dein Deployment wiederholen.
 
-### a) Catalog reachable and rewritten
+### a) Katalog erreichbar und umgeschrieben
 
 ```bash
 curl -sS http://<relay-ip>:8080/apps.json \
   | jq '[.[].releases[].download] | .[0:3]'
 ```
 
-Every `download` URL must start with your `RELAY_PUBLIC_URL`.
+Jede `download`-URL muss mit deinem `RELAY_PUBLIC_URL` beginnen.
 
-### b) Install an app through the relay
+### b) App installieren
 
-Admin → Apps → install **Talk** (`spreed`) or another app. The relay log
-(`make logs`) shows one `tarball cache miss -> cached`. The Nextcloud
-log shows no signature error.
+Admin → Apps → z. B. **Talk** (`spreed`) installieren. Im Relay-Log
+erscheint einmal `tarball cache miss -> cached`, in Nextclouds Log
+keinerlei Signaturfehler.
 
-### c) Update flow
+### c) Update durchspielen
 
-Bump an existing app to a newer version. The relay log shows another
-cache-miss tarball download.
+Eine bereits installierte App auf eine neuere Version aktualisieren —
+zweiter Cache-Miss-Eintrag.
 
-### d) Verify signature passthrough end-to-end
+### d) Signatur durchgereicht (End-to-End)
 
-Pick any app/version and reproduce the exact check Nextcloud performs
-(`openssl_verify(tarball, signature, certificate, SHA512)`):
+Reproduziert exakt den Check, den Nextcloud intern macht:
+`openssl_verify(tarball, signature, certificate, SHA-512)`.
 
 ```bash
 RELAY=http://<relay-ip>:8080
 APP=spreed
 VER=9.0.9
 
+# 1) Tarball über den Relay laden
 curl -sSL "$RELAY/download/$APP/$VER/$APP-$VER.tar.gz" -o /tmp/$APP.tgz
+
+# 2) Signatur + Zertifikat aus dem (umgeschriebenen) apps.json ziehen
 curl -sS "$RELAY/apps.json" | jq -r \
   --arg app "$APP" --arg ver "$VER" '
     .[] | select(.id == $app)
@@ -151,12 +180,14 @@ jq -r .sig  /tmp/$APP.meta.json | base64 -d > /tmp/$APP.sig.bin
 openssl x509 -in /tmp/$APP.cert.pem -pubkey -noout -out /tmp/$APP.pub.pem
 openssl dgst -sha512 -verify /tmp/$APP.pub.pem \
   -signature /tmp/$APP.sig.bin /tmp/$APP.tgz
-# → "Verified OK"
+# -> "Verified OK"
 ```
 
-If this prints `Verified OK`, Nextcloud will also accept the tarball.
+Gibt das `Verified OK` aus, wird auch Nextcloud das Tarball akzeptieren.
+Sonst stimmt was mit dem Byte-Stream nicht — als erstes mit dem
+Direkt-Download per SHA-512 vergleichen.
 
-### e) Cache survives a restart
+### e) Cache überlebt Neustart
 
 ```bash
 make restart
@@ -164,72 +195,102 @@ time curl -sS -o /dev/null \
   "http://<relay-ip>:8080/download/spreed/9.0.9/spreed-9.0.9.tar.gz"
 ```
 
-After restart the call is sub-second, served from disk. The relay log
-shows `loaded cached endpoint from disk` and `upstream not modified`.
+Sub-Sekunde nach Restart, Logs zeigen `loaded cached endpoint from disk`
+und `upstream not modified`.
 
 ---
 
-## Reverse proxy / HTTPS
+## Reverse Proxy / HTTPS
 
-The relay speaks plain HTTP. For DMZ-grade exposure, put a TLS terminator
-in front of it. Any of these work:
+Der Relay spricht reines HTTP. Für DMZ-Betrieb gehört ein TLS-Terminator
+davor. Drei gängige Varianten:
 
-- **Caddy**: `relay.example.org { reverse_proxy 127.0.0.1:8080 }` — done.
-- **nginx**: standard `proxy_pass http://127.0.0.1:8080;`.
-- **Traefik**: `traefik.http.routers.relay.rule=Host(\`relay.example.org\`)` plus the usual TLS labels.
+```caddy
+# Caddyfile
+relay.example.org {
+    reverse_proxy 127.0.0.1:8080
+}
+```
 
-Whatever you use, set `RELAY_PUBLIC_URL=https://relay.example.org` (no
-port if the proxy listens on 443) and `make restart`. Nextcloud will see
-HTTPS URLs in the rewritten `apps.json`.
+```nginx
+# nginx
+server {
+    listen 443 ssl http2;
+    server_name relay.example.org;
+    ssl_certificate     /etc/letsencrypt/live/relay.example.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.org/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+```yaml
+# Traefik (Labels am Relay-Service)
+labels:
+  - "traefik.http.routers.relay.rule=Host(`relay.example.org`)"
+  - "traefik.http.routers.relay.tls.certresolver=le"
+  - "traefik.http.services.relay.loadbalancer.server.port=8080"
+```
+
+In `.env` dann `RELAY_PUBLIC_URL=https://relay.example.org` setzen und
+`make restart` — Nextcloud sieht ab dann HTTPS-URLs im umgeschriebenen
+`apps.json`.
 
 ---
 
-## How Nextcloud talks to the relay (reference)
+## Wie Nextcloud den Relay anspricht (Referenz)
 
-Nextcloud's `AppFetcher` and `CategoryFetcher` build their URL as
+Nextclouds `AppFetcher` und `CategoryFetcher` bauen ihre URL als:
 
 ```
 <appstoreurl>/apps.json
 <appstoreurl>/categories.json
 ```
 
-(no platform suffix, no version header — see
-`lib/private/App/AppStore/Fetcher/Fetcher.php::getEndpoint`). So you
-point `appstoreurl` at the relay's root and the relay serves those two
-paths. Tarball downloads go to `/download/<app>/<version>/<filename>`
-on the relay; the rewritten `apps.json` already contains those URLs.
+(kein Platform-Suffix, kein Version-Header — siehe
+`lib/private/App/AppStore/Fetcher/Fetcher.php::getEndpoint`).
+
+`appstoreurl` zeigt also auf die Relay-Root, und der Relay liefert genau
+diese zwei Pfade. Tarball-Downloads gehen an
+`/download/<app>/<version>/<filename>` — diese URLs stehen schon in der
+umgeschriebenen `apps.json`.
 
 ---
 
-## What can go wrong (and how to spot it early)
+## Was kaputt gehen kann (und wie man's merkt)
 
-The relay rides on top of two contracts it doesn't own: Nextcloud's
-fetcher code, and the App Store's JSON shape. Both can change. See
-[`LIMITATIONS.md`](LIMITATIONS.md) for the full list.
+Der Relay stützt sich auf zwei Verträge, die ihm nicht gehören: Nextclouds
+Fetcher-Code und das JSON-Schema des App Stores. Beide können sich
+ändern. Vollständige Liste in [`LIMITATIONS.md`](LIMITATIONS.md).
 
-Cheap canary: `make api-check` runs in a few seconds and validates the
-upstream shape. Schedule it (or wire it into your monitoring):
+Billiger Canary: `make api-check` läuft in Sekunden und prüft das
+Upstream-Schema. Ideal als Cronjob:
 
 ```cron
 0 * * * *  cd /opt/nextcloud-appstore-relay && make api-check >> /var/log/relay-canary.log 2>&1
 ```
 
-If it ever exits non-zero, the upstream changed in a way the relay
-doesn't handle — read `LIMITATIONS.md` for the matching failure mode.
+Exit-Code ≠ 0 heißt: Upstream hat sich verändert. Welche Bruchstelle das
+ist, steht in `LIMITATIONS.md`.
 
 ---
 
-## Building without Docker (optional)
+## Build ohne Docker (optional)
 
-The host doesn't need Go for the standard path — the Docker build
-compiles in a multi-stage image. If you want a native binary anyway:
+Der Standardweg läuft komplett in Docker — der Host braucht **kein** Go,
+der Multi-Stage-Build kompiliert intern. Wenn du trotzdem ein natives
+Binary willst:
 
 ```bash
-sudo apt install -y golang-go    # or: brew install go
+sudo apt install -y golang-go
 go build -o bin/relay .
 RELAY_PUBLIC_URL=http://127.0.0.1:8080 ./bin/relay
 ```
 
-## License
+---
 
-MIT — see [`LICENSE`](LICENSE).
+## Lizenz
+
+MIT — siehe [`LICENSE`](LICENSE).
