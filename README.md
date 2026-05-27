@@ -36,13 +36,14 @@ Implementierungsdetail.
 
 ## Inhaltsverzeichnis
 
-- [Quick Start (Ubuntu / Debian)](#quick-start-ubuntu--debian)
+- [Quick Start (Ubuntu / Debian / RHEL)](#quick-start-ubuntu--debian--rhel)
 - [Tagesbetrieb](#tagesbetrieb)
 - [Konfiguration](#konfiguration)
 - [Funktionstest](#funktionstest)
 - [Reverse Proxy / HTTPS](#reverse-proxy--https)
 - [Wie Nextcloud den Relay anspricht](#wie-nextcloud-den-relay-anspricht-referenz)
 - [Was kaputt gehen kann](#was-kaputt-gehen-kann-und-wie-mans-merkt)
+- [Anhalten, neu starten, updaten, deinstallieren](#anhalten-neu-starten-updaten-deinstallieren)
 - [Build ohne Docker (optional)](#build-ohne-docker-optional)
 - [Lizenz](#lizenz)
 
@@ -303,6 +304,97 @@ Upstream-Schema. Ideal als Cronjob:
 
 Exit-Code ≠ 0 heißt: Upstream hat sich verändert. Welche Bruchstelle das
 ist, steht in `LIMITATIONS.md`.
+
+---
+
+## Anhalten, neu starten, updaten, deinstallieren
+
+Alle Befehle aus dem Repo-Verzeichnis. `make` delegiert nötige
+Root-Rechte selbst an `sudo docker` — `sudo make …` ist also nicht
+zwingend, schadet aber nicht.
+
+### Stoppen
+
+```bash
+make stop
+```
+
+Container fährt runter. Cache + `.env` bleiben erhalten. Nach einem
+Reboot kommt der Relay **nicht** von selbst wieder hoch — du hast ihn
+explizit gestoppt (Compose-Policy `unless-stopped`).
+
+### Wieder starten
+
+```bash
+make start
+```
+
+Wenn das Image noch existiert (Normalfall nach `make stop`), läuft das
+in unter einer Sekunde. Sonst wird neu gebaut.
+
+### Reboot der Box
+
+Macht nichts kaputt: Docker-Daemon ist via systemd aktiviert
+(`systemctl enable docker`, vom Installer erledigt), und der Container
+hat `restart: unless-stopped`. Er kommt nach jedem Reboot automatisch
+wieder hoch — es sei denn, du hast vorher `make stop` ausgeführt.
+
+Status prüfen:
+
+```bash
+make status
+```
+
+### Änderungen in `.env` anwenden
+
+Nach jedem Edit der `.env`:
+
+```bash
+make restart
+```
+
+### Neuere Version vom Code ziehen
+
+```bash
+make update
+```
+
+Das macht: `git pull` → Image neu bauen → mit neuer Version
+hochfahren. Cache bleibt erhalten.
+
+### Cache komplett platt machen
+
+Selten nötig — z. B. wenn ein Tarball auf Disk korrupt wirkt:
+
+```bash
+make clean-cache
+```
+
+Setzt den Disk-Cache zurück und startet den Container neu. Der nächste
+NC-Request holt alles wieder vom Upstream.
+
+### Komplett deinstallieren
+
+Auf dem Relay-Host:
+
+```bash
+make stop
+sudo docker volume rm nextcloud-appstore-relay_relay-cache
+sudo docker image rm nextcloud-appstore-relay:local
+cd ..
+rm -rf nextcloud-appstore-relay
+```
+
+Auf der Nextcloud-Seite das `appstoreurl` zurücksetzen:
+
+```bash
+# bare metal / snap:
+sudo -u www-data php occ config:system:delete appstoreurl
+
+# nextcloud im docker:
+sudo docker exec -u www-data <nextcloud-container> \
+    php occ config:system:delete appstoreurl
+```
 
 ---
 
