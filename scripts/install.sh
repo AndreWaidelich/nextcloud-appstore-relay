@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# One-shot installer for nextcloud-appstore-relay on Ubuntu / Debian.
+# One-shot installer for nextcloud-appstore-relay on Ubuntu / Debian / RHEL.
 #
 # What it does (each step is idempotent):
-#   1. verifies it runs on a supported OS
-#   2. installs missing dependencies (curl, jq, docker, docker compose plugin)
+#   1. detects OS family + package manager
+#   2. installs missing dependencies (make, curl, jq, docker, docker compose)
 #   3. asks for the relay's public URL (or takes it from --public-url)
 #   4. writes .env from .env.example
 #   5. runs scripts/api-check.sh against the upstream
@@ -64,55 +64,133 @@ confirm() {
     [[ "$ans" =~ ^[Yy]$ ]]
 }
 
-# ---- 1. OS check -------------------------------------------------------------
+# ---- 1. OS + package manager detection ---------------------------------------
 say "OS check"
 if [[ ! -f /etc/os-release ]]; then
     die "/etc/os-release missing -- cannot determine OS"
 fi
 # shellcheck disable=SC1091
 . /etc/os-release
-case "${ID:-}${ID_LIKE:-}" in
+
+FAMILY=""
+case "${ID:-} ${ID_LIKE:-}" in
     *ubuntu*|*debian*)
-        ok "detected ${PRETTY_NAME:-$ID}"
-        ;;
+        FAMILY=debian ;;
+    *rhel*|*fedora*|*centos*|*rocky*|*almalinux*)
+        FAMILY=rhel ;;
     *)
-        warn "this script targets Ubuntu/Debian; detected '${PRETTY_NAME:-$ID}'"
+        warn "this script targets Debian/Ubuntu and RHEL/Fedora/Rocky/Alma; detected '${PRETTY_NAME:-$ID}'"
         confirm "continue anyway?" || die "aborted"
+        # Best-effort fallback based on which package manager exists.
+        if command -v apt-get >/dev/null 2>&1; then FAMILY=debian
+        elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then FAMILY=rhel
+        else die "no supported package manager found"
+        fi
         ;;
 esac
+
+PKG=""
+if [[ $FAMILY == debian ]]; then
+    PKG=apt
+elif command -v dnf >/dev/null 2>&1; then
+    PKG=dnf
+elif command -v yum >/dev/null 2>&1; then
+    PKG=yum
+else
+    die "no supported package manager (apt, dnf, yum) found"
+fi
+
+ok "detected ${PRETTY_NAME:-$ID} (family=$FAMILY, pkg=$PKG)"
 
 # ---- 2. dependencies ---------------------------------------------------------
 say "Dependencies"
 need_root
 
-apt_install() {
-    info "installing: $*"
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+pkg_install() {
+    case "$PKG" in
+        apt)
+            info "apt-get install: $*"
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+            ;;
+        dnf)
+            info "dnf install: $*"
+            $SUDO dnf install -y -q "$@"
+            ;;
+        yum)
+            info "yum install: $*"
+            $SUDO yum install -y -q "$@"
+            ;;
+    esac
 }
 
+pkg_available() {
+    case "$PKG" in
+        apt)  apt-cache show "$1" >/dev/null 2>&1 ;;
+        dnf)  $SUDO dnf list "$1" >/dev/null 2>&1 ;;
+        yum)  $SUDO yum list "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+# Basic tools: make, curl, jq
 missing=()
+command -v make >/dev/null 2>&1 || missing+=(make)
 command -v curl >/dev/null 2>&1 || missing+=(curl)
 command -v jq   >/dev/null 2>&1 || missing+=(jq)
 if [[ ${#missing[@]} -gt 0 ]]; then
-    apt_install "${missing[@]}"
+    pkg_install "${missing[@]}"
 fi
-ok "curl + jq present"
+ok "make + curl + jq present"
+
+# ---- 3. Docker + compose -----------------------------------------------------
+install_docker_debian() {
+    info "installing docker.io from the distro repo"
+    pkg_install docker.io
+}
+
+install_compose_debian() {
+    info "installing docker compose plugin"
+    if pkg_available docker-compose-v2; then
+        pkg_install docker-compose-v2
+    elif pkg_available docker-compose-plugin; then
+        pkg_install docker-compose-plugin
+    else
+        die "neither docker-compose-v2 nor docker-compose-plugin is available via apt; install Docker's official package per https://docs.docker.com/engine/install/"
+    fi
+}
+
+install_docker_rhel() {
+    info "adding Docker's official RHEL repo"
+    pkg_install dnf-plugins-core || pkg_install yum-utils
+    # rhel | fedora | centos -- match the right repo file
+    case "${ID:-}" in
+        fedora)
+            $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+            ;;
+        rhel|rocky|almalinux|centos|*)
+            $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo \
+                || $SUDO dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            ;;
+    esac
+    info "installing docker-ce + docker compose plugin"
+    pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
 
 if ! command -v docker >/dev/null 2>&1; then
-    info "docker not found, installing docker.io from the distro repo"
-    apt_install docker.io
+    if [[ $FAMILY == debian ]]; then
+        install_docker_debian
+    else
+        install_docker_rhel
+    fi
 fi
 ok "docker present ($(docker --version 2>/dev/null || echo unknown))"
 
 if ! docker compose version >/dev/null 2>&1; then
-    info "docker compose plugin not found, installing"
-    if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
-        apt_install docker-compose-v2
-    elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
-        apt_install docker-compose-plugin
+    if [[ $FAMILY == debian ]]; then
+        install_compose_debian
     else
-        die "neither docker-compose-v2 nor docker-compose-plugin is available via apt; install Docker's official package per https://docs.docker.com/engine/install/"
+        # Docker CE on RHEL ships docker-compose-plugin; if not present, retry.
+        pkg_install docker-compose-plugin || die "docker compose plugin missing"
     fi
 fi
 ok "docker compose plugin present ($(docker compose version --short 2>/dev/null || echo unknown))"
@@ -126,7 +204,7 @@ ok "docker service is active"
 # Note: we don't add the invoking user to the docker group here. If you want
 # rootless docker invocations, run: sudo usermod -aG docker $USER  (then log out/in).
 
-# ---- 3. relay configuration --------------------------------------------------
+# ---- 4. relay configuration --------------------------------------------------
 say "Relay configuration (.env)"
 if [[ ! -f .env.example ]]; then
     die ".env.example missing -- are you running this from the repo root?"
@@ -179,7 +257,7 @@ else
 fi
 ok ".env updated"
 
-# ---- 4. upstream sanity ------------------------------------------------------
+# ---- 5. upstream sanity ------------------------------------------------------
 if [[ $SKIP_API_CHECK -eq 0 ]]; then
     say "Upstream API sanity check"
     bash scripts/api-check.sh
@@ -187,7 +265,7 @@ else
     warn "skipping upstream API check (--skip-api-check)"
 fi
 
-# ---- 5. build + start --------------------------------------------------------
+# ---- 6. build + start --------------------------------------------------------
 say "Build + start"
 $SUDO docker compose up -d --build
 
@@ -203,16 +281,17 @@ for i in $(seq 1 15); do
     [[ $i -eq 15 ]] && warn "relay did not become healthy in 15s (check: docker compose logs)"
 done
 
-# ---- 6. next steps -----------------------------------------------------------
+# ---- 7. next steps -----------------------------------------------------------
 say "Next steps on the Nextcloud host"
 cat <<EOF
-  On the Nextcloud host (not here), run:
+  On the Nextcloud host (not here), run one of:
 
+      # bare metal / snap
       sudo -u www-data php occ config:system:set appstoreurl --value="${PUBLIC_URL}"
 
-  Or add to config/config.php:
-
-      'appstoreurl' => '${PUBLIC_URL}',
+      # nextcloud in docker
+      sudo docker exec -u www-data <nextcloud-container> \\
+          php occ config:system:set appstoreurl --value="${PUBLIC_URL}"
 
   Useful commands here on the relay host:
 

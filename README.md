@@ -48,20 +48,27 @@ Implementierungsdetail.
 
 ---
 
-## Quick Start (Ubuntu / Debian)
+## Quick Start (Ubuntu / Debian / RHEL)
 
-Drei Zeilen auf dem Host, der den Relay laufen lassen soll:
+Auf dem Host, der den Relay laufen lassen soll:
 
 ```bash
 git clone https://github.com/AndreWaidelich/nextcloud-appstore-relay.git
 cd nextcloud-appstore-relay
-sudo make install
+sudo bash scripts/install.sh
 ```
+
+> Auf RHEL/Fedora/Rocky/Alma ist `make` standardmäßig nicht installiert —
+> deshalb hier `bash scripts/install.sh` statt `make install`. Der
+> Installer zieht `make` als Erstes mit nach, danach gehen `make logs`,
+> `make restart` usw. auch dort.
 
 Der Installer (`scripts/install.sh`) ist idempotent und macht:
 
-1. Prüft, dass es ein Ubuntu/Debian ist.
-2. Installiert fehlende Pakete: `curl`, `jq`, `docker.io`, `docker-compose-v2`.
+1. Erkennt OS-Familie + Paketmanager (apt / dnf / yum).
+2. Installiert fehlende Pakete: `make`, `curl`, `jq`, `docker`,
+   `docker compose`-Plugin. Auf RHEL wird dafür Docker's offizielles
+   `docker-ce`-Repo eingerichtet.
 3. Fragt nach `RELAY_PUBLIC_URL` (die URL, unter der deine Nextcloud den
    Relay erreicht). Default: `http://<host-ip>:8080`.
 4. Schreibt `.env`.
