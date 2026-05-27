@@ -1,0 +1,23 @@
+services:
+  relay:
+    build: .
+    image: nextcloud-appstore-relay:local
+    container_name: nextcloud-appstore-relay
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - relay-cache:/var/cache/relay
+    healthcheck:
+      test: ["CMD", "/relay", "-version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The distroless image has no shell. A proper healthcheck would use
+      # wget/curl on /healthz; for the default image, rely on the orchestrator
+      # to monitor the container restart status instead.
+      disable: true
+
+volumes:
+  relay-cache:

@@ -1,0 +1,9 @@
+/bin/
+/cache/
+/.env
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/
+.claude/
