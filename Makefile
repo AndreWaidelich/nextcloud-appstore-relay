@@ -42,6 +42,6 @@ update:  ## pull repo changes, rebuild image, restart
 clean-cache:  ## delete the on-disk cache (relay will re-fetch everything on next request)
 	$(COMPOSE) down
 	$(DOCKER) volume rm nextcloud-appstore-relay_relay-cache || true
-	$(COMPOSE) up -d
+	$(COMPOSE) up -d --build
 
 .PHONY: help install install-yes api-check start stop restart logs status update clean-cache
