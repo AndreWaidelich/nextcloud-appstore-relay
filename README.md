@@ -72,9 +72,31 @@ Der Installer (`scripts/install.sh`) ist idempotent und macht:
 
 Danach **einmal auf der Nextcloud** (nicht hier):
 
+**Bare-Metal / Snap-Install:**
+
 ```bash
 sudo -u www-data php occ config:system:set appstoreurl \
     --value="http://<relay-ip>:8080"
+```
+
+**Nextcloud im Docker-Container** (offizielles `nextcloud`-Image, AIO,
+Linuxserver.io — Container-Namen ggf. anpassen):
+
+```bash
+sudo docker exec -u www-data <nextcloud-container> \
+    php occ config:system:set appstoreurl \
+    --value="http://<relay-ip>:8080"
+```
+
+Container-Name nicht parat? `sudo docker ps --format '{{.Names}}'`
+zeigt alle laufenden Container.
+
+Alternative ohne `occ`: in der `config.php` (auf bare metal unter
+`/var/www/nextcloud/config/config.php`, im offiziellen Docker-Image als
+Volume gemountet) folgenden Eintrag ergänzen:
+
+```php
+'appstoreurl' => 'http://<relay-ip>:8080',
 ```
 
 Fertig. Admin → Apps installieren oder updaten. `make logs` zeigt im
