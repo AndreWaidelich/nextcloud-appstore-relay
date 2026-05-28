@@ -96,6 +96,19 @@ sudo docker exec -u www-data <nextcloud-container> \
     --value="http://<relay-ip>:8080"
 ```
 
+Private IP-Adressen müssen noch in der Nextcloud freigegeben werden:
+
+**Bare metal / Snap**:
+```
+sudo -u www-data php occ config:system:set allow_local_remote_servers --value=true --type=boolean
+```
+
+**Nextcloud im Docker**:
+```
+sudo docker exec -u www-data <nextcloud-container> \
+    php occ config:system:set allow_local_remote_servers --value=true --type=boolean
+```
+
 Container-Name nicht parat? `sudo docker ps --format '{{.Names}}'`
 zeigt alle laufenden Container.
 
